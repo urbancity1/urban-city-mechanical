@@ -1,24 +1,9 @@
-import * as client from "openid-client";
-import { Strategy, type VerifyFunction } from "openid-client/passport";
-
 import passport from "passport";
 import session from "express-session";
 import type { Express, RequestHandler } from "express";
-import memoize from "memoizee";
 import connectPg from "connect-pg-simple";
-import { authStorage } from "./storage";
 
 const IS_REPLIT = !!process.env.REPL_ID;
-
-const getOidcConfig = memoize(
-  async () => {
-    return await client.discovery(
-      new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
-      process.env.REPL_ID!
-    );
-  },
-  { maxAge: 3600 * 1000 }
-);
 
 export function getSession() {
   const sessionTtl = 7 * 24 * 60 * 60 * 1000;
@@ -42,31 +27,14 @@ export function getSession() {
   });
 }
 
-function updateUserSession(
-  user: any,
-  tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers
-) {
-  user.claims = tokens.claims();
-  user.access_token = tokens.access_token;
-  user.refresh_token = tokens.refresh_token;
-  user.expires_at = user.claims?.exp;
-}
-
-async function upsertUser(claims: any) {
-  await authStorage.upsertUser({
-    id: claims["sub"],
-    email: claims["email"],
-    firstName: claims["first_name"],
-    lastName: claims["last_name"],
-    profileImageUrl: claims["profile_image_url"],
-  });
-}
-
 export async function setupAuth(app: Express) {
   app.set("trust proxy", 1);
   app.use(getSession());
   app.use(passport.initialize());
   app.use(passport.session());
+
+  passport.serializeUser((user: Express.User, cb) => cb(null, user));
+  passport.deserializeUser((user: Express.User, cb) => cb(null, user));
 
   // Password-based auth mode (Railway / non-Replit environments)
   if (!IS_REPLIT) {
@@ -93,25 +61,46 @@ export async function setupAuth(app: Express) {
       });
     });
 
-    passport.serializeUser((user: Express.User, cb) => cb(null, user));
-    passport.deserializeUser((user: Express.User, cb) => cb(null, user));
     return;
   }
 
-  // Replit OIDC auth mode
+  // Replit OIDC auth mode — dynamically imported to avoid ESM issues in CJS builds
   app.get("/api/auth/mode", (_req, res) => res.json({ mode: "replit" }));
+
+  const client = await import("openid-client");
+  const { Strategy } = await import("openid-client/passport");
+
+  const memoize = (await import("memoizee")).default;
+
+  const getOidcConfig = memoize(
+    async () => {
+      return await client.discovery(
+        new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
+        process.env.REPL_ID!
+      );
+    },
+    { maxAge: 3600 * 1000 }
+  );
 
   const config = await getOidcConfig();
 
-  const verify: VerifyFunction = async (
-    tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers,
-    verified: passport.AuthenticateCallback
-  ) => {
-    const user = {};
-    updateUserSession(user, tokens);
-    await upsertUser(tokens.claims());
-    verified(null, user);
-  };
+  function updateUserSession(user: any, tokens: any) {
+    user.claims = tokens.claims();
+    user.access_token = tokens.access_token;
+    user.refresh_token = tokens.refresh_token;
+    user.expires_at = user.claims?.exp;
+  }
+
+  async function upsertUser(claims: any) {
+    const { authStorage } = await import("./storage");
+    await authStorage.upsertUser({
+      id: claims["sub"],
+      email: claims["email"],
+      firstName: claims["first_name"],
+      lastName: claims["last_name"],
+      profileImageUrl: claims["profile_image_url"],
+    });
+  }
 
   const registeredStrategies = new Set<string>();
 
@@ -125,15 +114,17 @@ export async function setupAuth(app: Express) {
           scope: "openid email profile offline_access",
           callbackURL: `https://${domain}/api/callback`,
         },
-        verify
+        async (tokens: any, verified: passport.AuthenticateCallback) => {
+          const user = {};
+          updateUserSession(user, tokens);
+          await upsertUser(tokens.claims());
+          verified(null, user);
+        }
       );
       passport.use(strategy);
       registeredStrategies.add(strategyName);
     }
   };
-
-  passport.serializeUser((user: Express.User, cb) => cb(null, user));
-  passport.deserializeUser((user: Express.User, cb) => cb(null, user));
 
   app.get("/api/login", (req, res, next) => {
     ensureStrategy(req.hostname);
@@ -151,7 +142,8 @@ export async function setupAuth(app: Express) {
     })(req, res, next);
   });
 
-  app.get("/api/logout", (req, res) => {
+  app.get("/api/logout", async (req, res) => {
+    const config = await getOidcConfig();
     req.logout(() => {
       res.redirect(
         client.buildEndSessionUrl(config, {
@@ -187,9 +179,24 @@ export const isAuthenticated: RequestHandler = async (req, res, next) => {
   }
 
   try {
+    const client = await import("openid-client");
+    const memoize = (await import("memoizee")).default;
+    const getOidcConfig = memoize(
+      async () => {
+        return await client.discovery(
+          new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
+          process.env.REPL_ID!
+        );
+      },
+      { maxAge: 3600 * 1000 }
+    );
     const config = await getOidcConfig();
     const tokenResponse = await client.refreshTokenGrant(config, refreshToken);
-    updateUserSession(user, tokenResponse);
+    const claims = tokenResponse.claims();
+    user.claims = claims;
+    user.access_token = tokenResponse.access_token;
+    user.refresh_token = tokenResponse.refresh_token;
+    user.expires_at = claims?.exp;
     return next();
   } catch (error) {
     res.status(401).json({ message: "Unauthorized" });
